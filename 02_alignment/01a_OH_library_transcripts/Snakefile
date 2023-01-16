@@ -1,0 +1,98 @@
+# OH-library counts preparation
+
+# generate files with raw counts for positive and negative strands separately from the alignment:
+# final raw count file includes positions for individual transcripts
+
+# this is a sub-pipeline!
+
+import os
+
+workdir: config['output']
+
+output_dir = config['output']
+
+samples, = glob_wildcards(os.path.join(output_dir, "{samples}-OH" + ".sorted.dedup.bam"))
+
+
+# keep only hits of read1 of properly mapped pairs (83/99) AND only unique hits
+rule filter_unique_mapped_reads_OH:
+    input:
+        bams = os.path.join(output_dir, "{index}-OH" +
+                                                  ".sorted.dedup.bam")
+    output:
+        unique_reads = temp(os.path.join(output_dir, "{index}-OH" +
+                                                  ".sorted.dedup.unique.bam"))
+    shell:
+        """(samtools view -H {input.bams}; samtools view -f 0x2 -f 0x40 -F 0x100 {input.bams} | grep -E "\<NH:i:1\>") | samtools view -b > {output.unique_reads}"""
+
+
+# collect alignment stats after filtering
+rule collect_alignment_stats_after_filtering_OH:
+    input:
+        unique_reads = rules.filter_unique_mapped_reads_OH.output.unique_reads
+    output:
+        logs = os.path.join(output_dir,"{index}-OH" +
+                                                  ".sorted.dedup.unique.stats")
+    shell:
+        """samtools stats {input.unique_reads} | grep ^SN | cut -f 2- > {output.logs}"""
+
+
+# convert bam to bed
+rule convert_bam_to_bed_OH:
+    input:
+        bam = rules.filter_unique_mapped_reads_OH.output.unique_reads
+    output:
+        bed = temp(os.path.join(output_dir,"{index}-OH" +
+                                                      ".sorted.dedup.unique.bed"))
+    shell:
+        """bedtools bamtobed -i {input.bam} > {output.bed}"""
+
+
+# intersections with transcriptome
+rule intersect_alignment_with_transcriptome_OH:
+    input:
+        bed = rules.convert_bam_to_bed_OH.output.bed,
+        no_overlaps = os.path.join(output_dir, 'transcripts.no_overlaps.gff')
+    output:
+        filtered_bed = os.path.join(output_dir,"{index}-OH" +
+                                                      ".sorted.dedup.unique.intersect.bed")
+    shell:
+        """bedtools intersect -u -s -f 1.0 -a {input.bed} -b {input.no_overlaps} > {output.filtered_bed}"""
+
+
+# coverage of transcriptome (per transcript in gff)
+rule find_transcripts_coverage_OH:
+    input:
+        filtered_bed = rules.intersect_alignment_with_transcriptome_OH.output.filtered_bed,
+        no_overlaps = os.path.join(output_dir, 'transcripts.no_overlaps.gff')
+    output:
+        transcripts_coverage = temp(os.path.join(output_dir, "{index}-OH" +
+                                                  ".transcripts.coverage.gff"))
+    run:
+        shell("""bedtools coverage -s -a {input.no_overlaps} -b {input.filtered_bed} > {output.transcripts_coverage}""")
+
+
+# on + strand count STARTS
+rule collect_raw_counts_OH_plus:
+    input:
+        filtered_bed = rules.intersect_alignment_with_transcriptome_OH.output.filtered_bed
+    params:
+        awk_strand = '$6=="+"'
+    output:
+        oh_plus_strand = os.path.join(output_dir,"{index}-OH" +
+                                                      ".sorted.dedup.unique.intersect.pos_strand.raw_count")
+    shell:
+        """awk '{params.awk_strand}' {input.filtered_bed} |  sort -t$'\\t' -k1,1 -k2,2n | awk -F '\\t' '{{print $1,$2-1}}' |  uniq -c > {output.oh_plus_strand}"""
+
+
+# on - strand count ENDS, BED coordinates are semi-open => end-1!
+rule collect_raw_counts_OH_minus:
+    input:
+        filtered_bed = rules.intersect_alignment_with_transcriptome_OH.output.filtered_bed
+    params:
+        awk_strand ='$6=="-"'
+    output:
+        oh_minus_strand = os.path.join(output_dir,"{index}-OH" +
+                                                      ".sorted.dedup.unique.intersect.neg_strand.raw_count")
+    shell:
+        """awk '{params.awk_strand}' {input.filtered_bed} |  sort -t$'\\t' -k1,1 -k3,3n | awk -F '\\t' '{{print $1,$3}}' |  uniq -c > {output.oh_minus_strand}"""

@@ -1,0 +1,88 @@
+# generate the alignment from umiremoved both sides reads with segemehl
+# it's important to prepare the index file of reference genome with segemehl
+
+# this is a sub-pipeline!
+
+import os
+
+workdir: config['output']
+
+output_dir = config['output']
+ref_genome_fasta = config['genome']
+ref_genome_segemehl_index = config['index']
+reads_length_threshold = str(config['reads_length_threshold'])
+transcriptome_annotation = config['transcriptome_annotation']
+
+samples, = glob_wildcards(os.path.join(config['output'], "{samples}_R1.umiremoved_both" +
+                                                                  ".clipped.fastq.gz"))
+
+
+rule map_paired_reads_to_reference_genome:
+    input:
+        read_1 = os.path.join(output_dir, "{index}_R1.umiremoved_both"  +
+                                                                  ".clipped.fastq.gz"),
+        read_2 = os.path.join(output_dir, "{index}_R2.umiremoved_both"  +
+                                                                  ".clipped.fastq.gz")
+    output:
+        alignment = temp(os.path.join(output_dir, "{index}" + ".bam"))
+    params:
+        ref_genome_segemehl_index = ref_genome_segemehl_index,
+        ref_genome_fasta = ref_genome_fasta
+    shell:
+        """/opt/bin/segemehl.x -b -i {params.ref_genome_segemehl_index} -d {params.ref_genome_fasta} -q {input.read_1} -p {input.read_2} > {output.alignment}"""
+
+
+rule sort_alignment:
+    input:
+        alignment = rules.map_paired_reads_to_reference_genome.output.alignment
+    output:
+        sorted_alignment = temp(os.path.join(output_dir, "{index}" + ".sorted.bam"))
+    shell:
+        """samtools sort {input.alignment} -o {output.sorted_alignment}"""
+
+rule index_alignment:
+    input:
+        sorted_alignment = rules.sort_alignment.output.sorted_alignment
+    output:
+        sorted_alignment_index = temp(os.path.join(output_dir,"{index}" +
+                                                                  ".sorted.bam.bai"))
+    shell:
+        """samtools index {input.sorted_alignment}"""
+
+
+# do the deduplication (!the result is not completely reproducible
+# because the representative UMI for a group may be chosen at random!)
+rule umi_deduplication:
+    input:
+        sorted_alignment = rules.sort_alignment.output.sorted_alignment,
+        sorted_alignment_index = rules.index_alignment.output.sorted_alignment_index
+    output:
+        sorted_dedup_alignment = os.path.join(output_dir,"{index}" +
+                                                                  ".sorted.dedup.bam")
+    shell:
+        """umi_tools dedup --paired -I {input.sorted_alignment} -S {output.sorted_dedup_alignment}"""
+
+
+# collect alignment stats before filtering
+rule collect_alignment_stats_before_filtering:
+    input:
+        bams = os.path.join(output_dir,"{index}" +
+                                                  ".sorted.dedup.bam")
+    output:
+        logs = os.path.join(output_dir,"{index}" +
+                                                  ".sorted.dedup.stats")
+    shell:
+        """samtools stats {input.bams} | grep ^SN | cut -f 2- > {output.logs}"""
+
+
+# prepare transcriptome annotation without overlaps for further steps
+# remove transcripts from transcriptome annotations that have overlapping regions with other transcripts (if overlapping on same strand)
+rule prepare_transcripts_wo_overlaps:
+    output:
+        intersect_self = temp(os.path.join(output_dir, 'transcripts.intersect_self.gff')),
+        overlaps = temp(os.path.join(output_dir, 'transcripts.overlaps.gff')),
+        no_overlaps = os.path.join(output_dir, 'transcripts.no_overlaps.gff')
+    run:
+        shell("""bedtools intersect -s -a {transcriptome_annotation} -b {transcriptome_annotation} > {output.intersect_self}""")
+        shell("""bedtools subtract -F 1 -s -a {output.intersect_self} -b {transcriptome_annotation} > {output.overlaps}""")
+        shell("""bedtools subtract -A -s -a {transcriptome_annotation} -b {output.overlaps} > {output.no_overlaps}""")

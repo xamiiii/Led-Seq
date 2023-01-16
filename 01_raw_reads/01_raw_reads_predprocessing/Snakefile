@@ -1,0 +1,191 @@
+# preprocessing raw reads steps and generate:
+# - reads for alignment step (in gz archive)
+# - FastQC reports
+# - logs and trim stats
+
+# this is a sub-pipeline!
+
+import os
+
+workdir: config['output']
+
+input_dir = config['input']
+output_dir = config['output']
+reads_length_threshold = str(config['reads_length_threshold'])
+
+samples, = glob_wildcards(os.path.join(config['input'], "{samples}_R1_001.fastq.gz"))
+
+
+# generate fastqc reports with raw reads
+rule analyze_raw_reads:
+    input:
+        read_1 = os.path.join(input_dir, "{index}_R1_001.fastq.gz"),
+        read_2 = os.path.join(input_dir, "{index}_R2_001.fastq.gz")
+    params:
+        folder_1 = os.path.join(output_dir, "qc/00_raw/{index}_R1"),
+        folder_2 = os.path.join(output_dir, "qc/00_raw/{index}_R2")
+    output:
+        qc_check_1_files_R1 = os.path.join(config['output'],
+            "qc/00_raw/{index}_R1/{index}_R1_001_fastqc.html"),
+        qc_check_1_files_R2 = os.path.join(config['output'],
+            "qc/00_raw/{index}_R2/{index}_R2_001_fastqc.html"),
+
+    run:
+        shell("""mkdir -p {params.folder_1} {params.folder_2}""")
+        shell("""fastqc -o {params.folder_1} {input.read_1}""")
+        shell("""fastqc -o {params.folder_2} {input.read_2}""")
+
+
+# collect all fastqc reports to one with multiqc
+rule collect_all_reports_in_one_qc_1:
+    input:
+        qc_check_1_files_R1 = expand(os.path.join(config['output'],
+            "qc/00_raw/{index}_R1/{index}_R1_001_fastqc.html"), index=samples),
+        qc_check_1_files_R2 = expand(os.path.join(config['output'],
+            "qc/00_raw/{index}_R2/{index}_R2_001_fastqc.html"), index=samples)
+    output:
+        multiqc_check_1 = os.path.join(os.path.join(config['output'],
+            "qc/00_raw/multiqc_report.html"))
+    params:
+        qc_1_folder = os.path.join(os.path.join(config['output'],
+            "qc/00_raw/"))
+    shell:
+        """multiqc {params.qc_1_folder} -o {params.qc_1_folder}"""
+
+# save these files for further UMI analysis (if needed)
+rule remove_3adaptors_from_both_reads:
+    input:
+        read_1 = os.path.join(input_dir, "{index}_R1_001.fastq.gz"),
+        read_2 = os.path.join(input_dir, "{index}_R2_001.fastq.gz")
+    output:
+        read_1_clipped = temp(os.path.join(output_dir,"{index}_R1.clipped.fastq")),
+        read_2_clipped = temp(os.path.join(output_dir,"{index}_R2.clipped.fastq")),
+        cutadapt_log = os.path.join(output_dir,"{index}_01_3adapter_cutting_log")
+    shell:
+        """cutadapt -a TGGAATTCTCGGGTGCCAAGG -A GATCGTCGGACTGTAGAACTCTGAAC -o {output.read_1_clipped} -p {output.read_2_clipped} {input.read_1} {input.read_2} &> {output.cutadapt_log}"""
+
+
+rule filter_for_correct_UMI_sequence_in_read2:
+    input:
+        read_1_clipped = rules.remove_3adaptors_from_both_reads.output.read_1_clipped,
+        read_2_clipped = rules.remove_3adaptors_from_both_reads.output.read_2_clipped
+    output:
+        read_1_umifiltered = temp(os.path.join(output_dir,"{index}_R1.umifiltered.clipped.fastq")),
+        read_1_umifiltered_discard = temp(os.path.join(output_dir,"{index}_R1.discard.clipped.fastq")),
+        read_2_umifiltered = temp(os.path.join(output_dir,"{index}_R2.umifiltered.clipped.fastq")),
+        read_2_umifiltered_discard = temp(os.path.join(output_dir,"{index}_R2.discard.clipped.fastq")),
+        cutadapt_log = os.path.join(output_dir,"{index}_02_corrUMI_cutting_log")
+    shell:
+        """cutadapt --action=none -G ^NNNNNNNNCTGACATC -O 16 --untrimmed-output {output.read_1_umifiltered_discard} --untrimmed-paired-output {output.read_2_umifiltered_discard} -o {output.read_1_umifiltered} -p {output.read_2_umifiltered} {input.read_1_clipped} {input.read_2_clipped} &> {output.cutadapt_log}"""
+
+
+# extract UMI from read2 and add to header in read1 and read 2
+rule extract_and_remove_UMI_1:
+    input:
+        read_1_umifiltered = rules.filter_for_correct_UMI_sequence_in_read2.output.read_1_umifiltered,
+        read_2_umifiltered = rules.filter_for_correct_UMI_sequence_in_read2.output.read_2_umifiltered
+    output:
+        read_1_umiremoved = temp(os.path.join(output_dir,"{index}_R1.umiremoved.clipped.fastq")),
+        read_2_umiremoved = temp(os.path.join(output_dir,"{index}_R2.umiremoved.clipped.fastq"))
+    shell:
+        """umi_tools extract --bc-pattern=NNNNNNNN -I {input.read_2_umifiltered} -S {output.read_2_umiremoved} --read2-in={input.read_1_umifiltered} --read2-out={output.read_1_umiremoved}"""
+
+
+# remove CTGACATC from beginning of read2 and remove reads where ANY of read1 or read2 is shorter than reads_length_threshold nt
+rule extract_and_remove_UMI_2:
+    input:
+        read_1_umiremoved = rules.extract_and_remove_UMI_1.output.read_1_umiremoved,
+        read_2_umiremoved = rules.extract_and_remove_UMI_1.output.read_2_umiremoved
+    params:
+        reads_length = reads_length_threshold
+    output:
+        read_1_umiremoved_filtered = temp(os.path.join(output_dir,"{index}_R1.min" +
+                                                                  "nt.umiremoved.clipped.fastq")),
+        read_2_umiremoved_filtered = temp(os.path.join(output_dir,"{index}_R2.min" +
+                                                                  "nt.umiremoved.clipped.fastq"))
+    shell:
+        """cutadapt --minimum-length {params.reads_length}:{params.reads_length} -G ^CTGACATC -O 8 -o {output.read_1_umiremoved_filtered} -p {output.read_2_umiremoved_filtered} {input.read_1_umiremoved} {input.read_2_umiremoved}"""
+
+
+# remove potential GATGTCAGNNNNNNNN from 3' end of R1
+rule extract_and_remove_UMI_3:
+    input:
+        read_1_umiremoved_filtered = rules.extract_and_remove_UMI_2.output.read_1_umiremoved_filtered,
+        read_2_umiremoved_filtered = rules.extract_and_remove_UMI_2.output.read_2_umiremoved_filtered
+    params:
+        reads_length = reads_length_threshold
+    output:
+        read_1_umiremoved_both = temp(os.path.join(output_dir,"{index}_R1.umiremoved_both" +
+                                                                  ".clipped.fastq")),
+        read_2_umiremoved_both = temp(os.path.join(output_dir,"{index}_R2.umiremoved_both" +
+                                                                  ".clipped.fastq")),
+        cutadapt_log = os.path.join(output_dir,"{index}_03_woUMI_cutting_length_log")
+    shell:
+        """cutadapt --minimum-length {params.reads_length}:{params.reads_length} -a GATGTCAGNNNNNNNNX -o {output.read_1_umiremoved_both} -p {output.read_2_umiremoved_both} {input.read_1_umiremoved_filtered}  {input.read_2_umiremoved_filtered} &> {output.cutadapt_log}"""
+
+
+# generate fastqc reports with UMI removed reads
+rule analyze_reads_after_umi_remove:
+    input:
+        read_1_umiremoved_both = rules.extract_and_remove_UMI_3.output.read_1_umiremoved_both,
+        read_2_umiremoved_both = rules.extract_and_remove_UMI_3.output.read_2_umiremoved_both
+    params:
+        folder_1 = os.path.join(output_dir, "qc/01_umi_removed/{index}_R1.clipped"),
+        folder_2 = os.path.join(output_dir, "qc/01_umi_removed/{index}_R2.clipped")
+    output:
+        qc_check_2_files_R1 = os.path.join(config['output'],
+            "qc/01_umi_removed/{index}_R1.clipped" +
+                                                  "/{index}_R1.umiremoved_both" +
+                                                  ".clipped_fastqc.html"),
+        qc_check_2_files_R2 = os.path.join(config['output'],
+            "qc/01_umi_removed/{index}_R2.clipped" +
+                                                  "/{index}_R2.umiremoved_both" +
+                                                  ".clipped_fastqc.html"),
+    run:
+        shell("""mkdir -p {params.folder_1} {params.folder_2}""")
+        shell("""fastqc -o {params.folder_1} {input.read_1_umiremoved_both}""")
+        shell("""fastqc -o {params.folder_2} {input.read_2_umiremoved_both}""")
+
+
+# collect all fastqc reports to one with multiqc
+rule collect_all_reports_in_one_qc_2:
+    input:
+        qc_check_2_files_R1 = expand(os.path.join(config['output'],
+            "qc/01_umi_removed/{index}_R1.clipped" +
+                                                  "/{index}_R1.umiremoved_both" +
+                                                              ".clipped_fastqc.html"),
+            index=samples),
+        qc_check_2_files_R2 = expand(os.path.join(config['output'],
+            "qc/01_umi_removed/{index}_R2.clipped" +
+                                                  "/{index}_R2.umiremoved_both" +
+                                                              ".clipped_fastqc.html"),
+            index=samples)
+    output:
+        multiqc_check_2 = os.path.join(os.path.join(config['output'],
+            "qc/01_umi_removed/multiqc_report.html"))
+    params:
+        qc_2_folder = os.path.join(os.path.join(config['output'],
+            "qc/01_umi_removed/"))
+    shell:
+        """multiqc {params.qc_2_folder} -o {params.qc_2_folder}"""
+
+
+rule zip_files:
+    input:
+        read_1_umiremoved_both = rules.extract_and_remove_UMI_3.output.read_1_umiremoved_both,
+        read_2_umiremoved_both = rules.extract_and_remove_UMI_3.output.read_2_umiremoved_both,
+        read_1 = rules.remove_3adaptors_from_both_reads.output.read_1_clipped,
+        read_2 = rules.remove_3adaptors_from_both_reads.output.read_2_clipped
+    output:
+        read_1_umiremoved_both_gz = os.path.join(output_dir,"{index}_R1.umiremoved_both" +
+                                                                  ".clipped.fastq.gz"),
+        read_2_umiremoved_both_gz = os.path.join(output_dir,"{index}_R2.umiremoved_both" +
+                                                                  ".clipped.fastq.gz"),
+        read_1_gz = temp(os.path.join(output_dir,"{index}_R1.clipped.fastq.gz")),
+        read_2_gz = temp(os.path.join(output_dir,"{index}_R2.clipped.fastq.gz"))
+    run:
+        shell("""gzip -c {input.read_1_umiremoved_both} > {output.read_1_umiremoved_both_gz}""")
+        shell("""gzip -c {input.read_2_umiremoved_both} > {output.read_2_umiremoved_both_gz}""")
+        shell("""gzip -c {input.read_1} > {output.read_1_gz}""")
+        shell("""gzip -c {input.read_2} > {output.read_2_gz}""")
+

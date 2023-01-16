@@ -1,0 +1,9 @@
+snakemake>=6
+fastqc>=0.11.9
+multiqc
+cutadapt>=2.8
+umi_tools>=1.0.1
+segemehl>=0.2
+samtools
+bedtools
+numpy

@@ -1,0 +1,81 @@
+# generate files with normalized counts for high covered transcripts
+
+# this is a sub-pipeline!
+
+import os
+
+workdir: config['output']
+
+output_dir = config['output']
+genome = config['genome']
+
+samples, = glob_wildcards(os.path.join(output_dir, "{samples}" +
+                                                      "transcripts.coverage.gff"))
+
+
+rule normalize_counts:
+    input:
+        no_overlaps = os.path.join(output_dir, 'transcripts.no_overlaps.gff'),
+        neg_strand = os.path.join(output_dir, "{index}" +
+                                                      ".sorted.dedup.unique.intersect.neg_strand.raw_count"),
+        pos_strand = os.path.join(output_dir, "{index}" +
+                                                      ".sorted.dedup.unique.intersect.pos_strand.raw_count"),
+        genome = genome
+
+    output:
+        normalize_counts = os.path.join(output_dir, "{index}" +
+                                                      ".normalized_counts")
+    script:
+        "scripts/10_normalize_transcripts_3.py"
+
+
+# sort transcripts by their coverage
+# transcript must be covered at least 75%;
+# print the count of aligned reads divided by transcript length (=normalized coverage)
+rule filter_and_normalize_transcripts_by_coverage:
+    input:
+        transcripts_coverage = os.path.join(output_dir, "{index}" +
+                                                  ".transcripts.coverage.gff")
+    output:
+        normalized_transcripts_coverage = temp(os.path.join(output_dir,"{index}" +
+                                                    ".transcripts.normalized_coverage.gff"))
+    shell:
+        """awk '$13>=0.75' {input.transcripts_coverage} | awk 'BEGIN{{OFS="\t"}} {{print  $0, ($10/$12)}}' > {output.normalized_transcripts_coverage}"""
+
+
+# sort the transcripts by their normalized coverage
+rule sort_transcripts_by_normalize_coverage:
+    input:
+        normalized_transcripts_coverage = rules.filter_and_normalize_transcripts_by_coverage.output.normalized_transcripts_coverage
+    output:
+        sorted_normalized_transcripts_coverage = temp(os.path.join(output_dir,"{index}" +
+                                                    ".transcripts.normalized_coverage.sorted.gff"))
+    shell:
+        """sort -t$'\\t' -k14,14nr {input.normalized_transcripts_coverage} > {output.sorted_normalized_transcripts_coverage}"""
+
+
+# normalized coverage must be >= 2.5
+# do the same in gff format
+rule filter_transcripts_by_normalize_coverage:
+    input:
+        sorted_normalized_transcripts_coverage = rules.sort_transcripts_by_normalize_coverage.output.sorted_normalized_transcripts_coverage
+    output:
+        covered_transcripts = os.path.join(output_dir,"{index}" +
+                                                    ".covered_transcripts"),
+        covered_transcripts_gff = os.path.join(output_dir,"{index}" +
+                                                    ".covered_transcripts.gff")
+    run:
+        shell("""awk 'BEGIN{{OFS="\t"}} $14>=2.5 {{print $0}}' {input.sorted_normalized_transcripts_coverage} > {output.covered_transcripts}""")
+        shell("""awk 'BEGIN{{OFS="\t"}} $14>=2.5 {{print $1, $2, $3, $4, $5, $6, $7, $8, $9}}' {input.sorted_normalized_transcripts_coverage} > {output.covered_transcripts_gff}""")
+
+
+# filter data (only covered transcripts) and integrate structural information
+rule filter_and_add_structure_information:
+    input:
+        covered_transcripts_gff = rules.filter_transcripts_by_normalize_coverage.output.covered_transcripts_gff,
+        normalize_counts = rules.normalize_counts.output.normalize_counts
+    output:
+        filtered_annotated_data = os.path.join(output_dir,"{index}" +
+                                                    ".normalized_counts.filtered")
+    script:
+        "scripts/30_filter_and_pimp.py"
